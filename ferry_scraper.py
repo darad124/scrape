@@ -10,7 +10,9 @@ import re
 import urllib.parse
 import itertools
 import json  # To help parse JSON arrays from JS
+import os
 
+# -------------------- Configuration --------------------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.5481.100 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.5414.87 Safari/537.36",
@@ -20,6 +22,11 @@ USER_AGENTS = [
 # Update this path to where your chromedriver executable is located.
 CHROME_DRIVER_PATH = r"C:\Users\USER\chromedriver\chromedriver-win64\chromedriver.exe"
 
+# File names for CSV output and checkpoint data.
+CSV_FILENAME = "ferry_schedules_progress.csv"
+CHECKPOINT_FILE = "checkpoint.json"
+
+# -------------------- Functions --------------------
 def setup_driver():
     """Set up and return a configured Chrome WebDriver."""
     chrome_options = Options()
@@ -185,22 +192,52 @@ def scrape_single_url(url, driver, search_date):
     all_schedules.extend(schedules)
     return all_schedules
 
-def save_to_csv(schedules, filename="ferry_schedules.csv"):
-    """Save schedules to a CSV file."""
-    if not schedules:
-        print("No schedules to save.")
-        return
+def write_csv_header_if_needed(filename, fields):
+    """Writes the CSV header if the file does not already exist."""
+    if not os.path.exists(filename):
+        with open(filename, mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=fields)
+            writer.writeheader()
 
+def append_to_csv(schedules, filename):
+    """Append schedule data to the CSV file."""
+    if not schedules:
+        return
     fields = ['search_date', 'from_location', 'to_location', 'departure_time',
               'arrival_time', 'price_adult', 'price_child', 
               'operator', 'vessel']
-
-    with open(filename, mode='w', newline='', encoding='utf-8') as file:
+    with open(filename, mode='a', newline='', encoding='utf-8') as file:
         writer = csv.DictWriter(file, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(schedules)
-    print(f"Schedules saved to {filename}")
+        for schedule in schedules:
+            writer.writerow(schedule)
+        file.flush()
 
+def load_checkpoint():
+    """Load checkpoint data if it exists, otherwise return defaults."""
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+                cp = json.load(f)
+                return cp.get("day_index", 0), cp.get("pair_index", 0)
+        except Exception as e:
+            print(f"Error reading checkpoint: {e}")
+    return 0, 0
+
+def update_checkpoint(day_index, pair_index):
+    """Write checkpoint data to file."""
+    cp = {"day_index": day_index, "pair_index": pair_index}
+    try:
+        with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+            json.dump(cp, f)
+    except Exception as e:
+        print(f"Error updating checkpoint: {e}")
+
+def clear_checkpoint():
+    """Remove the checkpoint file."""
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+
+# -------------------- Main Script --------------------
 def main():
     base_search_url = "https://www.phanganferries.com/search"
     # Define passenger counts: 1 adult and 1 child aged 3.
@@ -214,6 +251,12 @@ def main():
 
     print("Starting dynamic ferry schedule scraping for 7 days of data...")
 
+    # Prepare CSV file (write header if not exists)
+    csv_fields = ['search_date', 'from_location', 'to_location', 'departure_time',
+                  'arrival_time', 'price_adult', 'price_child', 
+                  'operator', 'vessel']
+    write_csv_header_if_needed(CSV_FILENAME, csv_fields)
+
     driver = setup_driver()
     try:
         # Get the list of locations (for both 'from' and 'to')
@@ -222,44 +265,59 @@ def main():
             print("No locations found. Exiting.")
             return
 
-        all_schedules = []
-        # Loop through each day
-        for day in range(num_days):
-            current_date = start_date + timedelta(days=day)
+        # Prepare all (from, to) pairs once.
+        all_pairs = [(frm, to) for frm, to in itertools.product(locations, repeat=2) if frm != to]
+        total_pairs = len(all_pairs)
+        print(f"Total route pairs to process each day: {total_pairs}")
+
+        # Load checkpoint if available.
+        current_day_index, current_pair_index = load_checkpoint()
+        print(f"Resuming from day index {current_day_index}, pair index {current_pair_index}")
+
+        # Loop through each day starting from the checkpoint.
+        for day_index in range(current_day_index, num_days):
+            current_date = start_date + timedelta(days=day_index)
             # Format the journey date as "DD MMM, YYYY" (e.g., "08 Feb, 2025")
             journey_date = current_date.strftime("%d %b, %Y")
             print(f"\nScraping data for date: {journey_date}")
 
-            # Loop through all location combinations (skip same-from-to pairs)
-            for from_loc, to_loc in itertools.product(locations, repeat=2):
-                if from_loc == to_loc:
-                    continue  # skip identical locations
+            # For each day, if resuming, start at the checkpoint pair; otherwise, from the start.
+            start_pair = current_pair_index if day_index == current_day_index else 0
+
+            for pair_index in range(start_pair, total_pairs):
+                from_loc, to_loc = all_pairs[pair_index]
                 url = construct_search_url(base_search_url, from_loc, to_loc, journey_date,
                                             adult_no=adult_no, children_no=children_no,
                                             children_ages=children_ages)
-                print(f"\nScraping route: {from_loc} -> {to_loc} on {journey_date}")
-                schedules = scrape_single_url(url, driver, journey_date)
-                if schedules:
-                    all_schedules.extend(schedules)
-                else:
-                    print("    No schedules found for this route.")
-                # Sleep a random amount to mimic human behavior and reduce load on the server.
-                time.sleep(random.uniform(2, 4))
-        
-        if all_schedules:
-            current_date_str = datetime.now().strftime("%Y-%m-%d")
-            csv_filename = f"ferry_schedules_{current_date_str}.csv"
-            save_to_csv(all_schedules, csv_filename)
-            print(f"\nSuccessfully scraped {len(all_schedules)} schedule entries.")
-        else:
-            print("No schedules were found for any route on any day.")
+                print(f"\nScraping route ({pair_index+1}/{total_pairs}): {from_loc} -> {to_loc} on {journey_date}")
+                try:
+                    schedules = scrape_single_url(url, driver, journey_date)
+                    if schedules:
+                        append_to_csv(schedules, CSV_FILENAME)
+                        print(f"    Appended {len(schedules)} schedule entries to CSV.")
+                    else:
+                        print("    No schedules found for this route.")
+                except Exception as e:
+                    print(f"Error scraping route {from_loc} -> {to_loc} on {journey_date}: {e}")
 
+                # Update checkpoint after each route.
+                update_checkpoint(day_index, pair_index + 1)
+                # Sleep a random amount to mimic human behavior.
+                time.sleep(random.uniform(2, 4))
+
+            # Finished one day. Reset pair index for the next day.
+            update_checkpoint(day_index + 1, 0)
+            # Reset current_pair_index so that for subsequent days we start at 0.
+            current_pair_index = 0
+
+        print("\nScraping completed for all days.")
+        clear_checkpoint()  # All done; remove the checkpoint.
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"An error occurred in the main loop: {e}")
     finally:
         driver.quit()
 
-    print("Scraping completed.")
+    print("Exiting script.")
 
 if __name__ == "__main__":
     main()
