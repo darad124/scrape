@@ -1,0 +1,122 @@
+{
+  "Koh Phangan": [
+    "Bangkok",
+    "Hua Hin ",
+    "Chumphon",
+    "Koh Tao",
+    "Koh Samui",
+    "Donsak",
+    "Surat Thani",
+    "Surat Thani Airport (URT)",
+    "Surat Thani Train Station",
+    "Nakhon Si Thamarat Airport (NST)",
+    "Phuket",
+    "Krabi",
+    "Koh Phi Phi",
+    "Chumphon Train Station",
+    "Khanom",
+    "Krabi Ao Nang",
+    "Khao Sok National Park"
+  ],
+  "Bangkok": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Hua Hin ": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Chumphon": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Koh Tao": [
+    "Koh Phangan",
+    "Bangkok",
+    "Hua Hin ",
+    "Chumphon",
+    "Koh Samui",
+    "Surat Thani",
+    "Surat Thani Airport (URT)",
+    "Surat Thani Train Station",
+    "Nakhon Si Thamarat Airport (NST)",
+    "Phuket",
+    "Krabi",
+    "Koh Phi Phi",
+    "Chumphon Train Station"
+  ],
+  "Koh Samui": [
+    "Koh Phangan",
+    "Bangkok",
+    "Hua Hin ",
+    "Chumphon",
+    "Koh Tao",
+    "Donsak",
+    "Surat Thani",
+    "Surat Thani Airport (URT)",
+    "Surat Thani Train Station",
+    "Nakhon Si Thamarat Airport (NST)",
+    "Phuket",
+    "Krabi",
+    "Koh Phi Phi",
+    "Chumphon Train Station",
+    "Khanom",
+    "Krabi Ao Nang",
+    "Khao Sok National Park"
+  ],
+  "Donsak": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Surat Thani": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Surat Thani Airport (URT)": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Surat Thani Train Station": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Nakhon Si Thamarat Airport (NST)": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Phuket": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Krabi": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Koh Phi Phi": [
+    "Koh Phangan",
+    "Koh Tao",
+    "Koh Samui"
+  ],
+  "Khanom": [
+    "Koh Phangan",
+    "Koh Samui"
+  ],
+  "Krabi Ao Nang": [
+    "Koh Phangan",
+    "Koh Samui"
+  ],
+  "Khao Sok National Park": [
+    "Koh Phangan",
+    "Koh Samui"
+  ]
+}

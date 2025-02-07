@@ -1,6 +1,14 @@
+import os
+# Suppress TensorFlow Lite logs (set before any TensorFlow or related libraries are imported)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 from bs4 import BeautifulSoup
 import time
 import csv
@@ -9,8 +17,9 @@ from datetime import datetime, timedelta
 import re
 import urllib.parse
 import itertools
-import json  # To help parse JSON arrays from JS
-import os
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # -------------------- Configuration --------------------
 USER_AGENTS = [
@@ -19,14 +28,18 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.5359.100 Safari/537.36"
 ]
 
-# Update this path to where your chromedriver executable is located.
 CHROME_DRIVER_PATH = r"C:\Users\USER\chromedriver\chromedriver-win64\chromedriver.exe"
-
-# File names for CSV output and checkpoint data.
 CSV_FILENAME = "ferry_schedules_progress.csv"
 CHECKPOINT_FILE = "checkpoint.json"
+MAX_WORKERS = 4
+VALID_ROUTES_FILE = "valid_routes.json"
+
+# Use a reentrant lock to avoid deadlocks in nested locking
+csv_lock = threading.RLock()
+thread_local = threading.local()
 
 # -------------------- Functions --------------------
+
 def setup_driver():
     """Set up and return a configured Chrome WebDriver."""
     chrome_options = Options()
@@ -35,21 +48,28 @@ def setup_driver():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument(f"user-agent={random.choice(USER_AGENTS)}")
-    
     service = Service(executable_path=CHROME_DRIVER_PATH)
     return webdriver.Chrome(service=service, options=chrome_options)
 
+def get_thread_driver():
+    """Get or create a thread-local WebDriver instance."""
+    if not hasattr(thread_local, "driver"):
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument(f"user-agent={random.choice(USER_AGENTS)}")
+        service = Service(executable_path=CHROME_DRIVER_PATH)
+        thread_local.driver = webdriver.Chrome(service=service, options=chrome_options)
+    return thread_local.driver
+
 def get_locations(driver):
-    """
-    Extract locations from the JavaScript variable 'fromCityList'
-    on the search page. This version uses json.loads() to preserve spaces.
-    """
+    """Extract locations from the JavaScript variable 'fromCityList'."""
     try:
         driver.get("https://www.phanganferries.com/search")
-        time.sleep(2)  # allow page to load
+        time.sleep(2)
         page_source = driver.page_source
-
-        # Look for: var fromCityList = ["Koh Phangan", "Krabi", ...];
         match = re.search(r'var\s+fromCityList\s*=\s*(\[[^\]]*\]);', page_source)
         if match:
             locations_json = match.group(1)
@@ -59,73 +79,104 @@ def get_locations(driver):
                 return locations
             except Exception as json_err:
                 print(f"JSON parsing error: {json_err}")
-                # Fallback: remove brackets and quotes manually
                 locations = locations_json.strip("[]").split(",")
                 locations = [loc.strip(' "\'') for loc in locations if loc.strip()]
                 print(f"Found locations (fallback): {locations}")
                 return locations
         else:
-            print("Error: 'fromCityList' variable not found in page source.")
+            print("Error: 'fromCityList' variable not found.")
             return []
     except Exception as e:
         print(f"Error getting locations: {e}")
         return []
 
 def extract_schedule_data(html, search_date=None):
-    """Extract schedule data including adult and child prices."""
+    """Extract schedule data from the HTML using BeautifulSoup."""
     soup = BeautifulSoup(html, "html.parser")
     schedules = []
 
-    schedule_items = soup.find_all("div", class_="tableout")
-    print(f"Found {len(schedule_items)} schedule items.")
-
-    for i, item in enumerate(schedule_items):
+    for i, item in enumerate(soup.find_all("div", class_="tableout")):
         print(f"\nProcessing schedule item {i+1}...")
         try:
-            # --- Operator extraction ---
+            # Extract operator information
+            operator_name = "N/A"
             operator_div = item.find("div", class_="wione")
-            if operator_div:
-                operator_img = operator_div.find("img")
-                if operator_img:
-                    logo_url = operator_img.get('src', '')
-                    # Extract operator name from the logo URL (using a simple heuristic)
-                    operator_name = logo_url.split('/')[-1].split('_')[-1].split('.')[0]
-                    operator_name = f"Operator_{operator_name[:8]}" if operator_name else "Unknown"
-                else:
-                    operator_name = "No Logo"
-            else:
-                operator_name = "N/A"
-            
-            # --- Basic info extraction from form-to div ---
+            if operator_div and (operator_img := operator_div.find("img")):
+                logo_url = operator_img.get('src', '')
+                operator_name = f"Operator_{logo_url.split('/')[-1].split('_')[-1].split('.')[0][:8]}" if logo_url else "No Logo"
+
+            # Extract departure and arrival info
             form_to_div = item.find("div", class_="form-to")
             if not form_to_div:
                 print(f"    Error: No form-to div found in item {i+1}")
                 continue
-
-            # Extract departure details
             from_div = form_to_div.find("div", class_="witwo")
             from_location = from_div.find("p", class_="location").text.strip() if from_div else "N/A"
             departure_time = from_div.find("h5", class_="time").text.strip() if from_div else "N/A"
-            
-            # Extract arrival details
             to_div = form_to_div.find("div", class_="withree")
             to_location = to_div.find("p", class_="location").text.strip() if to_div else "N/A"
             arrival_time = to_div.find("h5", class_="time").text.strip() if to_div else "N/A"
 
-            # --- Price extraction from wifive div ---
+            # Price extraction
             price_adult = "N/A"
             price_child = "N/A"
             price_div = item.find("div", class_="wifive")
             if price_div:
+                print(f"    Price div HTML: {price_div}")
                 spans = price_div.find_all("span")
-                if len(spans) > 0:
-                    price_adult = spans[0].text.strip()
-                    print(f"    Found adult price: {price_adult}")
-                if len(spans) > 1:
-                    price_child = spans[1].text.strip()
-                    print(f"    Found child price: {price_child}")
+                if spans:
+                    if len(spans) > 0:
+                        price_adult = spans[0].text.strip()
+                        print(f"    Found adult price (simple method): {price_adult}")
+                    if len(spans) > 1:
+                        price_child = spans[1].text.strip()
+                        print(f"    Found child price (simple method): {price_child}")
 
-            # --- Vehicle type detection ---
+                # Fallback methods if simple extraction fails
+                if price_adult == "N/A":
+                    print("    Simple price extraction failed, trying robust methods.")
+                    tour_price_div = price_div.find("div", class_="tour-price")
+                    if tour_price_div:
+                        print("    Found tour-price div")
+                        for p in tour_price_div.find_all("p"):
+                            p_text = p.get_text(strip=True)
+                            print(f"    Processing paragraph text: {p_text}")
+                            span = p.find("span")
+                            if span:
+                                if "Adult" in p_text or "adult" in p_text:
+                                    price_adult = span.get_text(strip=True)
+                                    print(f"    Found adult price (method 1): {price_adult}")
+                                elif "Child" in p_text or "child" in p_text:
+                                    price_child = span.get_text(strip=True)
+                                    print(f"    Found child price (method 1): {price_child}")
+                        if price_adult == "N/A" or price_child == "N/A":
+                            print("    Trying method 2 for price extraction")
+                            for span in price_div.find_all("span"):
+                                parent_text = span.parent.get_text(strip=True)
+                                span_text = span.get_text(strip=True)
+                                print(f"    Analyzing span: {span_text} with parent text: {parent_text}")
+                                if "Adult" in parent_text or "adult" in parent_text:
+                                    if price_adult == "N/A":
+                                        price_adult = span_text
+                                        print(f"    Found adult price (method 2): {price_adult}")
+                                elif "Child" in parent_text or "child" in parent_text:
+                                    if price_child == "N/A":
+                                        price_child = span_text
+                                        print(f"    Found child price (method 2): {price_child}")
+                        if price_adult == "N/A" or price_child == "N/A":
+                            print("    Trying method 3 for price extraction")
+                            full_text = price_div.get_text(strip=True)
+                            print(f"    Full price div text: {full_text}")
+                            price_matches = re.findall(r'THB\s*(\d+(?:,\d+)?)', full_text)
+                            if len(price_matches) >= 2:
+                                if price_adult == "N/A":
+                                    price_adult = f"THB {price_matches[0]}"
+                                    print(f"    Found adult price (method 3): {price_adult}")
+                                if price_child == "N/A":
+                                    price_child = f"THB {price_matches[1]}"
+                                    print(f"    Found child price (method 3): {price_child}")
+
+            # Determine vessel type
             vehicle_types = []
             transport_div = form_to_div.find("div", class_="transport-icon")
             if transport_div:
@@ -146,82 +197,77 @@ def extract_schedule_data(html, search_date=None):
                 'operator': operator_name,
                 'vessel': vessel
             }
-
             schedules.append(schedule)
             print(f"    Successfully extracted schedule {i+1}")
             for key, value in schedule.items():
                 print(f"    {key}: {value}")
 
         except Exception as e:
-            print(f"Error processing schedule item {i+1}: {str(e)}")
+            print(f"Error processing schedule item {i+1}: {e}")
             continue
 
     return schedules
 
 def construct_search_url(base_url, from_location, to_location, journey_date, adult_no=1, children_no=0, children_ages=None):
-    """
-    Constructs the search URL using the provided parameters.
-    This version URL-encodes the parameters so that, for example,
-    "Koh Phangan" becomes "Koh+Phangan" and "Hua Hin" becomes "Hua+Hin",
-    and it includes empty order_type and order_by parameters.
-    """
+    """Constructs the search URL with parameters."""
     from_location_encoded = urllib.parse.quote_plus(from_location)
     to_location_encoded = urllib.parse.quote_plus(to_location)
     journey_date_encoded = urllib.parse.quote_plus(journey_date)
-    
     url = (f"{base_url}?order_type=&order_by=&loc_from={from_location_encoded}"
            f"&loc_to={to_location_encoded}"
            f"&journey_date={journey_date_encoded}"
            f"&adult_no={adult_no}"
            f"&children_no={children_no}")
-    
     if children_no > 0 and children_ages:
         for i, age in enumerate(children_ages, start=1):
             url += f"&children_age%5B{i}%5D={age}"
-    
     return url
-
-def scrape_single_url(url, driver, search_date):
-    """Scrapes data from a single URL and returns the schedule data."""
-    all_schedules = []
-    print(f"\nAccessing URL: {url}")
-    driver.get(url)
-    time.sleep(2)  # wait for page to load; adjust as needed
-
-    schedules = extract_schedule_data(driver.page_source, search_date)
-    all_schedules.extend(schedules)
-    return all_schedules
-
-def write_csv_header_if_needed(filename, fields):
-    """Writes the CSV header if the file does not already exist."""
-    if not os.path.exists(filename):
-        with open(filename, mode='w', newline='', encoding='utf-8') as file:
-            writer = csv.DictWriter(file, fieldnames=fields)
-            writer.writeheader()
 
 def append_to_csv(schedules, filename):
     """Append schedule data to the CSV file."""
     if not schedules:
         return
     fields = ['search_date', 'from_location', 'to_location', 'departure_time',
-              'arrival_time', 'price_adult', 'price_child', 
-              'operator', 'vessel']
-    with open(filename, mode='a', newline='', encoding='utf-8') as file:
-        writer = csv.DictWriter(file, fieldnames=fields)
-        for schedule in schedules:
-            writer.writerow(schedule)
-        file.flush()
+              'arrival_time', 'price_adult', 'price_child', 'operator', 'vessel']
+    # Locking is done here using the RLock
+    with csv_lock:
+        with open(filename, mode='a', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=fields)
+            for schedule in schedules:
+                writer.writerow(schedule)
+
+def scrape_route_for_date(args):
+    from_loc, to_loc, journey_date = args
+    driver = get_thread_driver()  # Reuse thread-local driver
+    try:
+        url = construct_search_url("https://www.phanganferries.com/search",
+                                     from_loc, to_loc, journey_date,
+                                     adult_no=1, children_no=1, children_ages=[3])
+        print(f"Scraping route: {from_loc} -> {to_loc} for {journey_date}")
+        driver.get(url)
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_all_elements_located((By.CLASS_NAME, "tableout"))
+        )
+        schedules = extract_schedule_data(driver.page_source, journey_date)
+        if schedules:
+            append_to_csv(schedules, CSV_FILENAME)
+            print(f"Found {len(schedules)} schedules for {from_loc} -> {to_loc}")
+            return len(schedules)
+        return 0
+    except Exception as e:
+        print(f"Error scraping route {from_loc} -> {to_loc}: {e}")
+        return 0
+    # Removed driver.quit() here
 
 def load_checkpoint():
-    """Load checkpoint data if it exists, otherwise return defaults."""
+    """Load checkpoint data if it exists."""
     if os.path.exists(CHECKPOINT_FILE):
         try:
             with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-                cp = json.load(f)
-                return cp.get("day_index", 0), cp.get("pair_index", 0)
+                return json.load(f)
         except Exception as e:
             print(f"Error reading checkpoint: {e}")
-    return 0, 0
+    return {"day_index": 0, "pair_index": 0}
 
 def update_checkpoint(day_index, pair_index):
     """Write checkpoint data to file."""
@@ -237,86 +283,101 @@ def clear_checkpoint():
     if os.path.exists(CHECKPOINT_FILE):
         os.remove(CHECKPOINT_FILE)
 
+def validate_route(from_loc, to_loc, journey_date):
+    """Check if a route exists by making a quick request."""
+    driver = get_thread_driver()
+    url = construct_search_url("https://www.phanganferries.com/search", from_loc, to_loc, journey_date, adult_no=1)
+    try:
+        driver.get(url)
+        WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        return len(driver.find_elements(By.CLASS_NAME, "tableout")) > 0
+    except Exception as e:
+        print(f"Error validating route {from_loc} -> {to_loc}: {e}")
+        return False
+
+def discover_valid_routes(locations, sample_date):
+    """Build a map of valid routes."""
+    valid_routes = {}
+    total_combinations = len(locations) * (len(locations) - 1)
+    print(f"Discovering valid routes from {total_combinations} possible combinations...")
+
+    route_combinations = [(from_loc, to_loc) for from_loc, to_loc in itertools.product(locations, repeat=2) if from_loc != to_loc]
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_route = {executor.submit(validate_route, from_loc, to_loc, sample_date): (from_loc, to_loc)
+                           for from_loc, to_loc in route_combinations}
+        for future in future_to_route:
+            try:
+                from_loc, to_loc = future_to_route[future]
+                is_valid = future.result()
+                if is_valid:
+                    valid_routes.setdefault(from_loc, []).append(to_loc)
+                    print(f"Valid route found: {from_loc} -> {to_loc}")
+            except Exception as e:
+                print(f"Error processing route validation: {e}")
+
+    with open(VALID_ROUTES_FILE, 'w', encoding='utf-8') as f:
+        json.dump(valid_routes, f, indent=2)
+    return valid_routes
+
+def load_or_discover_valid_routes(locations, sample_date):
+    """Load valid routes from file or discover them."""
+    if os.path.exists(VALID_ROUTES_FILE):
+        with open(VALID_ROUTES_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return discover_valid_routes(locations, sample_date)
+
 # -------------------- Main Script --------------------
+
 def main():
     base_search_url = "https://www.phanganferries.com/search"
-    # Define passenger counts: 1 adult and 1 child aged 3.
-    adult_no = 1
-    children_no = 1
-    children_ages = [3]
-
-    # Set the start date as February 8, 2025.
     start_date = datetime(2025, 2, 8)
-    num_days = 7  # Run for 7 consecutive days
+    num_days = 7
 
-    print("Starting dynamic ferry schedule scraping for 7 days of data...")
-
-    # Prepare CSV file (write header if not exists)
+    print("Starting optimized ferry schedule scraping...")
     csv_fields = ['search_date', 'from_location', 'to_location', 'departure_time',
-                  'arrival_time', 'price_adult', 'price_child', 
-                  'operator', 'vessel']
-    write_csv_header_if_needed(CSV_FILENAME, csv_fields)
+                  'arrival_time', 'price_adult', 'price_child', 'operator', 'vessel']
+    # Write CSV header if the file does not exist
+    if not os.path.exists(CSV_FILENAME):
+        with open(CSV_FILENAME, mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=csv_fields)
+            writer.writeheader()
 
+    # Use a single driver instance for initial location discovery
     driver = setup_driver()
     try:
-        # Get the list of locations (for both 'from' and 'to')
         locations = get_locations(driver)
         if not locations:
             print("No locations found. Exiting.")
             return
-
-        # Prepare all (from, to) pairs once.
-        all_pairs = [(frm, to) for frm, to in itertools.product(locations, repeat=2) if frm != to]
-        total_pairs = len(all_pairs)
-        print(f"Total route pairs to process each day: {total_pairs}")
-
-        # Load checkpoint if available.
-        current_day_index, current_pair_index = load_checkpoint()
-        print(f"Resuming from day index {current_day_index}, pair index {current_pair_index}")
-
-        # Loop through each day starting from the checkpoint.
-        for day_index in range(current_day_index, num_days):
-            current_date = start_date + timedelta(days=day_index)
-            # Format the journey date as "DD MMM, YYYY" (e.g., "08 Feb, 2025")
-            journey_date = current_date.strftime("%d %b, %Y")
-            print(f"\nScraping data for date: {journey_date}")
-
-            # For each day, if resuming, start at the checkpoint pair; otherwise, from the start.
-            start_pair = current_pair_index if day_index == current_day_index else 0
-
-            for pair_index in range(start_pair, total_pairs):
-                from_loc, to_loc = all_pairs[pair_index]
-                url = construct_search_url(base_search_url, from_loc, to_loc, journey_date,
-                                            adult_no=adult_no, children_no=children_no,
-                                            children_ages=children_ages)
-                print(f"\nScraping route ({pair_index+1}/{total_pairs}): {from_loc} -> {to_loc} on {journey_date}")
-                try:
-                    schedules = scrape_single_url(url, driver, journey_date)
-                    if schedules:
-                        append_to_csv(schedules, CSV_FILENAME)
-                        print(f"    Appended {len(schedules)} schedule entries to CSV.")
-                    else:
-                        print("    No schedules found for this route.")
-                except Exception as e:
-                    print(f"Error scraping route {from_loc} -> {to_loc} on {journey_date}: {e}")
-
-                # Update checkpoint after each route.
-                update_checkpoint(day_index, pair_index + 1)
-                # Sleep a random amount to mimic human behavior.
-                time.sleep(random.uniform(2, 4))
-
-            # Finished one day. Reset pair index for the next day.
-            update_checkpoint(day_index + 1, 0)
-            # Reset current_pair_index so that for subsequent days we start at 0.
-            current_pair_index = 0
-
-        print("\nScraping completed for all days.")
-        clear_checkpoint()  # All done; remove the checkpoint.
-    except Exception as e:
-        print(f"An error occurred in the main loop: {e}")
     finally:
         driver.quit()
 
+    sample_date = start_date.strftime("%d %b, %Y")
+    valid_routes = load_or_discover_valid_routes(locations, sample_date)
+
+    # Build scraping tasks for each valid route on each day
+    scraping_tasks = []
+    for day_index in range(num_days):
+        current_date = start_date + timedelta(days=day_index)
+        journey_date = current_date.strftime("%d %b, %Y")
+        for from_loc, to_loc_list in valid_routes.items():
+            for to_loc in to_loc_list:
+                scraping_tasks.append((from_loc, to_loc, journey_date))
+
+    total_schedules = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(scrape_route_for_date, task) for task in scraping_tasks]
+        for future in futures:
+            try:
+                total_schedules += future.result()
+            except Exception as e:
+                print(f"Error processing task: {e}")
+
+    print(f"\nScraping completed. Total schedules found: {total_schedules}")
+    clear_checkpoint()
     print("Exiting script.")
 
 if __name__ == "__main__":
