@@ -130,20 +130,19 @@ def extract_route_details(route_div):
                     "arrival_time": trip_time.find("b").get_text(strip=True) if trip_time and trip_time.find("b") else "N/A",
                 }
             # --- Handle 'mobtrip-infoone' (Additional Transport and potential new segment) ---
-
             transport_icons_div = li.find("ul", class_="mobtrip-infoone")
             if transport_icons_div:
                 # Check if we need to create a NEW segment (if mobtrip-infoone exists)
                 if len(route_details["segments"]) >= 1:
-                      new_segment = {
+                    new_segment = {
                         "from": current_segment["to"],  # New 'from' is previous 'to'
                         "to": {},  # 'to' will be filled in the *next* iteration (or at the very end)
                         "transport": [],
                         "duration": "N/A",
                         "layover": "0 Hr. 0 Min.",  # Default
                     }
-                      route_details["segments"].append(new_segment)
-                      current_segment = new_segment
+                    route_details["segments"].append(new_segment)
+                    current_segment = new_segment
 
                 for img in transport_icons_div.find_all("img"):
                     src = img.get("src")
@@ -170,7 +169,6 @@ def extract_route_details(route_div):
             "arrival_time": last_trip_time.find("b").get_text(strip=True) if last_trip_time and last_trip_time.find("b") else "N/A",
         }
 
-
     # --- Extract Durations and Layovers (from route-detail-right) ---
     transport_right_div = route_div.find("div", class_="route-detail-right")
     if transport_right_div:
@@ -178,7 +176,7 @@ def extract_route_details(route_div):
         segment_index = 0
 
         for element in h5_elements:
-             if segment_index < len(route_details["segments"]): #prevent list out of bound
+            if segment_index < len(route_details["segments"]):  # prevent list out of bound
                 text = element.get_text(strip=True)
                 if "Layover" in text:
                     route_details["segments"][segment_index]["layover"] = text
@@ -237,7 +235,6 @@ def extract_schedule_data(html, search_date=None):
                 if transport_div.find("img", src="/img/icon_bus.png"): vehicle_types.append("Bus")
             vessel = " + ".join(vehicle_types) if vehicle_types else "N/A"
 
-
             # --- Find and extract detailed trip information ---
             trip_detail_main = item.find_next_sibling("div", class_="trip-detail-main")
             route_details = {}
@@ -293,6 +290,40 @@ def extract_schedule_data(html, search_date=None):
 
     return schedules
 
+def extract_coordinates(html):
+    """Extract ferry route coordinates from HTML using BeautifulSoup.
+    Returns separate fields for from_lat, from_lon, to_lat, and to_lon."""
+    soup = BeautifulSoup(html, "html.parser")
+    coordinates = []
+    # For each schedule container (tableout div)
+    for tableout_div in soup.find_all("div", class_="tableout"):
+        trip_detail = tableout_div.find_next_sibling("div", class_="trip-detail-main")
+        from_lat = "N/A"
+        from_lon = "N/A"
+        to_lat = "N/A"
+        to_lon = "N/A"
+        if trip_detail:
+            # Find the map tab with id starting with "trip_map-"
+            map_tab = trip_detail.find("div", id=lambda x: x and x.startswith("trip_map-"))
+            if map_tab:
+                # Find the search-map div within the map tab
+                search_map_div = map_tab.find("div", class_="search-map")
+                if search_map_div:
+                    try:
+                        from_lat = search_map_div.get("from_lat", "N/A")
+                        from_lon = search_map_div.get("from_long", "N/A")
+                        to_lat = search_map_div.get("to_lat", "N/A")
+                        to_lon = search_map_div.get("to_long", "N/A")
+                    except Exception as e:
+                        print(f"Error extracting coordinates: {e}")
+        coordinates.append({
+            "from_lat": from_lat,
+            "from_lon": from_lon,
+            "to_lat": to_lat,
+            "to_lon": to_lon
+        })
+    return coordinates
+
 def construct_search_url(base_url, from_location, to_location, journey_date, adult_no=1, children_no=0, children_ages=None):
     """Constructs the search URL."""
     from_location_encoded = urllib.parse.quote_plus(from_location)
@@ -314,7 +345,8 @@ def append_to_csv(schedules, filename):
         return
     fields = ['search_date', 'from_location', 'to_location', 'from_location_address', 'to_location_address',
               'departure_time', 'arrival_time', 'price_adult', 'price_child', 'operator', 'vessel',
-              'cancellation_policy', 'route_details','information']
+              'cancellation_policy', 'route_details', 'information',
+              'from_lat', 'from_lon', 'to_lat', 'to_lon']
     with csv_lock:
         with open(filename, mode='a', newline='', encoding='utf-8') as file:
             writer = csv.DictWriter(file, fieldnames=fields)
@@ -336,6 +368,16 @@ def scrape_route_for_date(args):
             EC.presence_of_all_elements_located((By.CLASS_NAME, "tableout"))
         )
         schedules = extract_schedule_data(driver.page_source, journey_date)
+        
+        # Extract and integrate ferry route coordinates into separate columns
+        coordinates = extract_coordinates(driver.page_source)
+        if coordinates:
+            for schedule, coord_data in zip(schedules, coordinates):
+                schedule['from_lat'] = coord_data['from_lat']
+                schedule['from_lon'] = coord_data['from_lon']
+                schedule['to_lat'] = coord_data['to_lat']
+                schedule['to_lon'] = coord_data['to_lon']
+                
         if schedules:
             append_to_csv(schedules, CSV_FILENAME)
             print(f"Found {len(schedules)} schedules for {from_loc} -> {to_loc}")
@@ -344,7 +386,6 @@ def scrape_route_for_date(args):
     except Exception as e:
         print(f"Error scraping route {from_loc} -> {to_loc}: {e}")
         return 0
-
 
 def validate_route(from_loc, to_loc, journey_date):
     """Check if a route exists."""
@@ -395,7 +436,8 @@ def load_or_discover_valid_routes(locations, sample_date):
 
 def main():
     base_search_url = "https://www.phanganferries.com/search"
-    start_date = datetime(2025, 2, 8)
+    # Starting from 12th February for 7 days
+    start_date = datetime(2025, 2, 12)
     num_days = 7
 
     print("Starting ferry schedule scraping...")
@@ -403,8 +445,9 @@ def main():
     # Write CSV header if the file does not exist or is empty
     if not os.path.exists(CSV_FILENAME) or os.stat(CSV_FILENAME).st_size == 0:
         csv_fields = ['search_date', 'from_location', 'to_location', 'from_location_address', 'to_location_address',
-                  'departure_time', 'arrival_time', 'price_adult', 'price_child', 'operator', 'vessel',
-                  'cancellation_policy', 'route_details','information']
+                      'departure_time', 'arrival_time', 'price_adult', 'price_child', 'operator', 'vessel',
+                      'cancellation_policy', 'route_details', 'information',
+                      'from_lat', 'from_lon', 'to_lat', 'to_lon']
         with open(CSV_FILENAME, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.DictWriter(file, fieldnames=csv_fields)
             writer.writeheader()
